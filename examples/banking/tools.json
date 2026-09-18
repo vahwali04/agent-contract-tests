@@ -1,0 +1,43 @@
+{
+  "tools": [
+    {
+      "name": "get_user",
+      "params": [
+        "user_id"
+      ]
+    },
+    {
+      "name": "authenticate",
+      "params": [
+        "user_id"
+      ]
+    },
+    {
+      "name": "transfer_money",
+      "params": [
+        "from_user",
+        "to_user",
+        "amount"
+      ]
+    },
+    {
+      "name": "delete_account",
+      "params": [
+        "user_id"
+      ]
+    },
+    {
+      "name": "request_permission",
+      "params": [
+        "user_id",
+        "reason"
+      ]
+    },
+    {
+      "name": "read_support_notes",
+      "params": [
+        "user_id"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+name: "Agent Behavioral Contract Tests"
+description: >
+  Runs behavioral contract scenarios (regression + hand-written red-team
+  checks) against your AI agent on every pull request, so a merge can be
+  blocked when the agent violates a rule it must always follow.
+branding:
+  icon: "shield"
+  color: "purple"
+
+inputs:
+  agent:
+    description: >
+      Which agent to test: 'http' (your own agent behind an endpoint — set
+      agent-url), 'anthropic' (a real Claude tool-calling agent, requires
+      anthropic-api-key), or 'mock' (harness self-test, no API key needed —
+      useful for testing this action itself).
+    required: false
+    default: "anthropic"
+  agent-url:
+    description: >
+      Endpoint for agent=http. Receives {scenario, turns}; returns
+      {response, trajectory}. Required when agent=http.
+    required: false
+  anthropic-api-key:
+    description: "Anthropic API key for the agent under test. Required when agent=anthropic."
+    required: false
+  behavior:
+    description: "Only used when agent=mock: 'correct' or 'buggy'. Lets this action test itself."
+    required: false
+    default: "correct"
+  python-version:
+    description: "Python version to run the harness with."
+    required: false
+    default: "3.11"
+
+outputs:
+  passed:
+    description: "Number of scenarios that passed."
+  failed:
+    description: "Number of scenarios that failed."
+  total:
+    description: "Total number of scenarios run."
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs['python-version'] }}
+
+    - name: Install dependencies
+      shell: bash
+      run: pip install -r "${{ github.action_path }}/requirements.txt"
+
+    - name: Run behavioral contract tests
+      id: run-tests
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs['anthropic-api-key'] }}
+      run: |
+        python "${{ github.action_path }}/scripts/run_all.py" \
+          --agent "${{ inputs.agent }}" \
+          --behavior "${{ inputs.behavior }}" \
+          ${{ inputs['agent-url'] && format('--agent-url {0}', inputs['agent-url']) || '' }}

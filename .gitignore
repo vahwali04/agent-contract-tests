@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+behavioral-test-report.md
+.agenttest_history.jsonl
+.agenttest_rejections.jsonl

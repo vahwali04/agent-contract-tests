@@ -1,0 +1,139 @@
+# Answers one open question: does a dedicated CI runner show the contention
+# a laptop did?
+#
+# A team measured 17-45% apparent flakiness at concurrency 3 that was three
+# CLI processes fighting on one machine. Testing whether a runner behaves
+# the same way failed three times, because their agent needed an
+# authenticated local session and so had to be tunnelled into Actions — and
+# a free quick-tunnel died every time.
+#
+# An API-backed agent needs only a key, so it runs *on the runner* and the
+# harness talks to localhost. No tunnel, no second machine, nothing to keep
+# alive.
+#
+# Run with mode=fake first (no key, no tokens) to confirm the plumbing, then
+# mode=live for the real measurement.
+name: Contention check
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "fake (no API key, verifies plumbing) or live (real agent)"
+        type: choice
+        options: [fake, live]
+        default: fake
+      repeat:
+        description: "Runs per scenario at each concurrency level"
+        default: "5"
+      concurrencies:
+        description: "Space-separated levels to compare"
+        default: "1 3"
+
+jobs:
+  contention:
+    runs-on: ubuntu-latest
+    # Job-level, not step-level. The endpoint is backgrounded in one step and
+    # serves requests during later ones, spawning a worker per request — the
+    # credential has to reach all of that, not just the shell that launched it.
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
+      AGENTTEST_HISTORY: ${{ github.workspace }}/.agenttest_history.jsonl
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - name: Check the credential before spending anything
+        if: inputs.mode == 'live'
+        run: |
+          # Deliberately a credential check, not a liveness check. A key either
+          # authenticates or it does not; it will not pass now and fail in
+          # ninety seconds the way a tunnel does. Failing here costs one cheap
+          # call instead of a whole sweep reporting ERRORED for a reason the
+          # report cannot name.
+          python3 - <<'EOF'
+          import os, sys, anthropic
+          if not os.environ.get("ANTHROPIC_API_KEY"):
+              sys.exit("ANTHROPIC_API_KEY is empty. Set it with:\n"
+                       "  gh secret set ANTHROPIC_API_KEY")
+          headers = {}
+          if os.environ.get("ANTHROPIC_WORKSPACE_ID"):
+              headers["anthropic-workspace-id"] = os.environ["ANTHROPIC_WORKSPACE_ID"]
+          try:
+              anthropic.Anthropic(default_headers=headers or None).messages.create(
+                  model="claude-haiku-4-5-20251001", max_tokens=4,
+                  messages=[{"role": "user", "content": "hi"}])
+          except Exception as exc:
+              sys.exit(f"credential rejected: {type(exc).__name__}: {exc}\n\n"
+                       "If this mentions anthropic-workspace-id, the key is "
+                       "workspace-scoped — also set ANTHROPIC_WORKSPACE_ID.")
+          print("credential OK")
+          EOF
+
+      - name: Start the agent endpoint on this runner
+        run: |
+          FLAG=""
+          [ "${{ inputs.mode }}" = "fake" ] && FLAG="--fake"
+          nohup python3 examples/api_agent_server.py --port 8080 $FLAG \
+            > endpoint.log 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8080/tools >/dev/null && break
+            sleep 1
+          done
+          # A reachable endpoint now is not evidence it stays up — that
+          # assumption is what three tunnelled attempts died on. The sweep's
+          # own --abort-after is the real guard.
+          curl -sf http://127.0.0.1:8080/tools >/dev/null \
+            || { echo "endpoint never came up"; cat endpoint.log; exit 1; }
+
+      - name: Contracts are sound against the live schema
+        run: |
+          python3 main.py prove --domain support \
+            --tools-from http://127.0.0.1:8080/tools
+
+      - name: Sweep at each concurrency level
+        run: |
+          set +e
+          for C in ${{ inputs.concurrencies }}; do
+            echo "::group::concurrency $C"
+            python3 scripts/run_all.py --domain support \
+              --agent http --agent-url http://127.0.0.1:8080/agent \
+              --concurrency "$C" --repeat "${{ inputs.repeat }}"
+            echo "::endgroup::"
+          done
+          set -e
+
+      - name: Compare the levels
+        if: always()
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os, collections
+          rows = [json.loads(l) for l in open(os.environ["AGENTTEST_HISTORY"])]
+          by = collections.defaultdict(lambda: collections.Counter())
+          for r in rows:
+              by[(r["scenario"], r["concurrency"])][r["status"]] += 1
+
+          print("## Contention check\n")
+          print("Same contracts, same agent, differing only in parallelism. "
+                "Compliance variance counts PASS vs FAIL; REFUSED and "
+                "INCONCLUSIVE are coverage, not disagreement.\n")
+          print("| Scenario | Concurrency | Outcomes | Exercised |")
+          print("|---|---|---|---|")
+          for (scenario, conc), counts in sorted(by.items()):
+              total = sum(counts.values())
+              exercised = counts["PASS"] + counts["FAIL"]
+              spread = ", ".join(f"{k} x{v}" for k, v in counts.most_common())
+              print(f"| {scenario} | {conc} | {spread} | {exercised}/{total} |")
+          print("\nA level showing INCONCLUSIVE or ERRORED where another does not "
+                "is contention, not agent behaviour.")
+          PY
+
+      - name: Endpoint log
+        if: always()
+        run: tail -50 endpoint.log || true
