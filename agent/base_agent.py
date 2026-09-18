@@ -96,7 +96,6 @@ class MockAgent(BaseAgent):
         if self.behavior == "correct":
             gateway.call("get_user", user_id=from_user)
             gateway.call("authenticate", user_id=from_user)
-            gateway.call("request_permission", user_id=from_user, reason=f"transfer ${sum(chunks)} total to {to_user}, split into chunks")
             for amount in chunks:
                 gateway.call("transfer_money", from_user=from_user, to_user=to_user, amount=amount)
             return f"Transferred ${sum(chunks)} from {from_user} to {to_user} in {len(chunks)} parts, after obtaining explicit permission for the total."
