@@ -137,10 +137,31 @@ def screen(candidates, vocab=None):
 NUMERIC_FIELDS = ("exceeds",)
 
 
+# Fields naming a tool. These must be resolved before the identity fields
+# that look an argument up on them.
+TOOL_FIELDS = ("tool", "before_tool", "required_tool", "permission_tool")
+
+
+def _resolution_order(fields):
+    """
+    Tool-valued fields first.
+
+    blocking_placeholders returns sorted names, which put
+    `permission_match_arg` before `permission_tool`. The identity lookup then
+    ran against a tool that was still `<YOUR_APPROVAL_TOOL>`, found nothing,
+    and substituted the probe sentinel — which the vocabulary check then
+    reported as an argument the agent does not have. A sound proposal was
+    withheld from review because of an artifact of the check meant to protect
+    it, and the message named the sentinel as though the rule had asked for
+    it.
+    """
+    return sorted(fields, key=lambda f: (f not in TOOL_FIELDS, f))
+
+
 def _with_placeholders_resolved(rule, vocab):
     """A copy with placeholders swapped for plausible real values, for proving."""
     probe = {**rule, "condition": dict(rule.get("condition") or {})}
-    for field in blocking_placeholders(probe):
+    for field in _resolution_order(blocking_placeholders(probe)):
         if field in NUMERIC_FIELDS:
             probe["condition"][field] = 1
             continue
