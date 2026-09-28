@@ -1,13 +1,5 @@
 # Pre-registered prediction: the inbox-cleanup benchmark
 
-> **The inputs are not in this repository.** The agent prompt, its mock tool
-> server and the ten contracts were written by another team and shared for
-> this benchmark; publishing their work is not this repo's call to make. The
-> commands below name paths that are absent here, and the result is recorded
-> without the material it was measured on. Numbers stated here are therefore
-> not independently reproducible from this repository alone — they are a
-> record of what was run, not an artefact you can re-run.
-
 Written **before** seeing the contracts, so the result cannot be rationalised
 after the fact. This project has twice published a number that turned out to
 measure something other than what it claimed; writing the expectation down
@@ -58,7 +50,7 @@ Against a vocabulary of eleven Gmail-shaped tools, schema-only produced:
 |---|---|---|
 | `must_never` | 5 | destructive verbs: archive, delete, forward, send, trash |
 | `must_ask_permission` | 0 | no threshold-shaped argument exists — an inbox has no `amount` |
-| `must_precede` | 0 | ordering has no structural signature in any schema |
+| `must_precede` | 0 | *(stated at the time as "ordering has no structural signature in any schema" — see the correction below)* |
 
 So the prediction, stated so it can be wrong:
 
@@ -255,3 +247,99 @@ renamed, a match key corrected, a rule moving from one column to another —
 the criterion is read against the original wording. Reclassifying a failure
 into a pass is the one move this whole apparatus exists to prevent, and it
 is most tempting when the reclassification is independently correct.
+
+---
+
+# Correction, after their review
+
+They checked all three questions and returned one finding that falsifies a
+claim made here, in the README, and in a guard test.
+
+## The boundary holds, for a better reason than the one given
+
+Confirmed, and sharpened: those four rules exist because each contract scopes
+its request narrowly enough that a single tool call becomes the violation — a
+workaround for this harness's lack of argument-content matching, which its own
+docs name. The real policy is in the prompt but classification-mediated
+("force NEEDS-HUMAN when money or credentials are involved"), and "classify
+this correctly" is not a tool call. There is no way to compile "never
+create_draft in response to a scam" into a general rule without also banning
+the routine-reply case create_draft exists for. An extractor proposing that
+ban would be wrong, not thorough.
+
+## "Ordering has no structural signature" was false
+
+Stated repeatedly and confidently: that ordering between tools cannot be seen
+in a schema, which made prose load-bearing for `must_precede`. The
+counterexample is in the vocabulary that was being measured the whole time.
+
+`update_message_labels` takes `addLabelIds`. Only `list_labels` and
+`create_label` mint a label id. That is a data dependency, and a data
+dependency is an ordering constraint — visible with no prose, no model call,
+and no interpretation.
+
+`from_parameter_provenance()` now reads it. Measured on their suite,
+schema-only recall goes 10/16 to 11/16 with invented still 0, and the new hit
+is `labels_resolved_before_use` scoring `exact` — the rule prose missed while
+proposing a wrong one about the same tool. The free deterministic source
+reaches it and the model does not.
+
+Two supporting fixes, both from the same conflation. A deliberate `null` is an
+answer, not a blank: their contract sets `match_arg: null` because
+`list_labels` is an account-wide lookup with no subject to match on. Schema
+completion was overwriting that with a guessed argument, and the benchmark was
+scoring it as unfilled. Absence means unanswered; `None` means answered.
+
+Their second suggestion — that numbered-list position is a mechanical signal,
+`list_labels` being step 2 of an explicit four-step startup sequence — is not
+implemented yet. It needs no model call either.
+
+## On the flag
+
+They believe they would have caught the wrong rule, and were explicit that
+their own sense of their vigilance is not trustworthy evidence, and that
+skimming a good flag in a batch of sixteen under time pressure is a real
+failure mode. The part worth keeping is the reason rather than the verdict:
+*"update_message_labels does not appear on the cited line"* is specific and
+falsifiable in ten seconds, where "please verify carefully" is the kind of
+caution a reviewer learns to skim.
+
+**Design bar for every flag added from here: specific and checkable, not
+cautious.** A flag that cannot be verified in seconds is not a weaker version
+of this one, it is a different and worse thing.
+
+## Declined: numbered-list position as an ordering signal
+
+The same review named two mechanical signals. One shipped, one should not.
+
+**Parameter provenance is structural.** `addLabelIds` takes a value only
+`list_labels` or `create_label` can produce. That dependency holds regardless
+of how the prompt is written, or whether there is a prompt.
+
+**List position is a formatting correlation.** `list_labels` being step 2 of a
+four-step startup sequence tracks ordering in this one document. A signal
+reading enumeration as evidence of a constraint would fire on any procedure,
+and most procedures are not contracts — it would be an invention source, and
+`invented: 0` has held across three domains.
+
+The model already settled it from the inside, declining those lines as
+*"procedural steps rather than safety rules with guarded actions"*. That is a
+correct read: a numbered startup sequence says what the agent does, not what
+it must never do.
+
+And the motivating case is gone. The miss it was meant to catch,
+`list_labels` before `update_message_labels`, is now an exact hit from
+provenance. What remained was a heuristic whose only argument was this
+scorecard — the identical argument for adding "draft" and "label" to
+DESTRUCTIVE_VERBS, declined earlier on exactly that ground.
+
+Worth recording the error rather than only the conclusion: the double
+standard was nearly applied in one direction. The verb-list change was
+refused because its only support was the benchmark; this one was about to be
+built on the same support, because it had been suggested by the team rather
+than thought of here. Where a proposal comes from does not change what counts
+as evidence for it.
+
+**To revisit, the case has to come from outside this scorecard** — a second
+domain where a numbered sequence encodes a constraint no other source
+reaches.

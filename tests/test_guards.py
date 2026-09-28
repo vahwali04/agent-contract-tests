@@ -1310,16 +1310,162 @@ class TestExtraction(unittest.TestCase):
              {"before_tool": "issue_refund", "required_tool": "verify_identity"})])
         self.assertTrue(result["hits"][0][4].startswith("unfilled"))
 
-    def test_structural_sources_cannot_reach_must_precede(self):
+    def test_an_email_subject_is_not_an_identity_argument(self):
         """
-        Measured, not assumed: ordering between tools has no structural
-        signature, so a schema alone can never propose must_precede. That is
-        what makes prompt extraction load-bearing rather than optional, and
-        it should fail loudly if a future change pretends otherwise.
+        `subject` was in IDENTITY_HINTS for its grammatical sense and
+        collides with an email's subject line. That made create_draft look
+        like it held a real choice between replyToMessageId and subject,
+        when subject can never work as an identity key — two threads
+        trivially share "Re: Thursday sync".
+
+        The fix their review pointed at is not giving a model more context
+        to choose well. It is not offering the candidate.
+        """
+        self.assertEqual(
+            extractor.identity_args(["to", "subject", "body", "replyToMessageId"]),
+            ["replyToMessageId"])
+
+    def test_an_identifier_collection_is_not_the_subject(self):
+        """
+        update_message_labels(messageId, addLabelIds, removeLabelIds) acts on
+        one message and carries a set of labels. The collections are payload;
+        the singular reference is what a rule follows.
+        """
+        self.assertEqual(
+            extractor.identity_args(["addLabelIds", "messageId", "removeLabelIds"]),
+            ["messageId"])
+
+    def test_a_tool_with_only_collections_keeps_them(self):
+        """
+        Filtering must narrow, never empty. A tool whose every identifier is
+        a collection still has to offer something, or the rule silently loses
+        its identity dimension instead of asking.
+        """
+        self.assertEqual(extractor.identity_args(["addLabelIds", "removeLabelIds"]),
+                         ["addLabelIds", "removeLabelIds"])
+
+    def test_a_genuine_choice_is_still_presented(self):
+        """
+        Narrowing must not manufacture certainty. from_user and to_user are
+        both real references meaning opposite things, and that decision
+        belongs to a human.
+        """
+        self.assertEqual(extractor.identity_args(["amount", "from_user", "to_user"]),
+                         ["from_user", "to_user"])
+
+    def test_a_markdown_stripped_quote_is_still_a_real_citation(self):
+        """
+        Regression from a live run. The model quoted line 13 of the
+        inbox-cleanup prompt faithfully but without its list prefix and **
+        emphasis, and the raw substring test reported a fabricated citation
+        on a rule whose citation was sound. Punctuation and decoration are
+        not content.
+
+        Third instance of markdown formatting breaking a string comparison
+        in this project, which is why the normaliser is now a named helper
+        rather than written out at each site.
+        """
+        line = ("2. **Never delete.** Removing the `INBOX` label is the "
+                "strongest removal you may perform.")
+        quote = "Never delete. Removing the `INBOX` label is the strongest re"
+        self.assertIn(extractor._words_only(quote)[:40],
+                      extractor._words_only(line))
+
+    def test_a_fabricated_quote_is_still_rejected(self):
+        """Normalising must not soften the check into accepting anything."""
+        line = "2. **Never delete.** Removing the `INBOX` label is the strongest."
+        quote = "Always delete every message in the inbox immediately"
+        self.assertNotIn(extractor._words_only(quote)[:40],
+                         extractor._words_only(line))
+
+    # -- parameter provenance ----------------------------------------------
+    #
+    # Contributed by the team whose suite this was measured against, as a
+    # correction to a claim made here repeatedly and wrongly.
+
+    GMAIL = {"list_labels": set(), "create_label": {"name"},
+             "update_message_labels": {"messageId", "addLabelIds", "removeLabelIds"},
+             "get_thread": {"threadId"}, "search_threads": {"query"}}
+
+    def test_a_data_dependency_is_an_ordering_constraint(self):
+        [c] = extractor.from_parameter_provenance(self.GMAIL)
+        cond = c["rule"]["condition"]
+        self.assertEqual(cond["before_tool"], "update_message_labels")
+        self.assertEqual(cond["required_tool"], "list_labels")
+
+    def test_the_unconditional_producer_is_preferred(self):
+        """
+        create_label also mints a label id, but only when one is absent.
+        Requiring it would fail every run where the label already existed,
+        so the lookup is the sound precondition — a property of the rule,
+        not of which tool a given suite happened to name.
+        """
+        [c] = extractor.from_parameter_provenance(self.GMAIL)
+        self.assertEqual(c["rule"]["condition"]["required_tool"], "list_labels")
+        self.assertTrue(any("create_label" in x for x in c["caveats"]),
+                        "the alternative producer must still be named")
+
+    def test_consumers_are_not_mistaken_for_producers(self):
+        """
+        get_thread takes a threadId; it does not issue one. Counting `get_`
+        as a producer proposes an ordering rule between nearly every pair of
+        tools in a vocabulary.
+        """
+        pairs = {(c["rule"]["condition"]["required_tool"],
+                  c["rule"]["condition"]["before_tool"])
+                 for c in extractor.from_parameter_provenance(self.GMAIL)}
+        self.assertNotIn(("get_thread", "update_message_labels"), pairs)
+        self.assertEqual(len(pairs), 1, pairs)
+
+    def test_one_rule_per_pair_not_per_argument(self):
+        """addLabelIds and removeLabelIds imply the same ordering once."""
+        self.assertEqual(len(extractor.from_parameter_provenance(self.GMAIL)), 1)
+
+    def test_an_explicit_null_survives_completion(self):
+        """
+        list_labels is an account-wide lookup, so the rule has no subject to
+        match on and the source writes None. Completion treated that as a
+        blank and overwrote it with a placeholder, turning a rule that was
+        exactly right into one reported as unfinished. Absence is
+        unanswered; None is answered.
+        """
+        [c] = extractor.from_parameter_provenance(self.GMAIL)
+        [out] = extractor.complete_from_schema([c], self.GMAIL)
+        self.assertIsNone(out["rule"]["condition"]["match_arg"])
+
+    def test_a_deliberate_null_scores_as_a_match(self):
+        proposal = extractor.candidate(
+            "must_precede", "medium", "tool schema", "-",
+            {"type": "must_precede",
+             "condition": {"before_tool": "update_message_labels",
+                           "required_tool": "list_labels",
+                           "match_arg": None, "required_match_arg": None}})
+        result = extractor.benchmark([proposal], [
+            ("a", "must_precede", "update_message_labels",
+             {"before_tool": "update_message_labels", "required_tool": "list_labels",
+              "match_arg": None, "required_match_arg": None})])
+        self.assertEqual(result["hits"][0][4], "exact")
+
+    def test_verb_and_threshold_heuristics_alone_reach_no_ordering(self):
+        """
+        Narrowed after being wrong. This asserted that ordering has no
+        structural signature at all and a schema could never propose
+        must_precede — repeated in the README, the benchmark output and a
+        prediction document, and false. The team whose suite it was measured
+        against pointed out the counterexample: update_message_labels takes
+        addLabelIds, and only list_labels or create_label mints a label id.
+        A data dependency between tools is an ordering constraint visible in
+        the schema alone.
+
+        What remains true is narrower and worth pinning: destructive-verb and
+        threshold-argument heuristics look at one tool at a time, so they
+        cannot see a relationship between two. Provenance is a separate
+        source, tested separately.
         """
         proposed = extractor.from_tool_schemas(self.SCHEMA)
         self.assertFalse([c for c in proposed if c["rule_type"] == "must_precede"],
-                         "a tool schema cannot express ordering between tools")
+                         "per-tool heuristics cannot see a relationship "
+                         "between two tools")
 
     def test_nothing_is_written(self):
         """The whole contract of this stage: it proposes, a human decides."""
@@ -1717,6 +1863,46 @@ class TestApprovalFlow(unittest.TestCase):
         reviewable, withheld = approval.screen([open_rule], self.VOCAB)
         self.assertEqual(len(reviewable), 1, withheld)
 
+    def test_a_dependent_placeholder_resolves_after_the_tool_it_names(self):
+        """
+        Regression from a live run. blocking_placeholders returns sorted
+        names, putting permission_match_arg before permission_tool, so the
+        identity lookup ran against a tool that was still
+        `<YOUR_APPROVAL_TOOL>`, found nothing, and fell back to the probe
+        sentinel. The vocabulary check then reported `unknown arg
+        '__probe__'` and withheld a sound proposal from review.
+
+        A check meant to protect a reviewer from unfalsifiable rules
+        removed a good one instead, and named its own sentinel as the
+        reason.
+        """
+        vocab = {"issue_refund": {"customer_id", "amount"},
+                 "escalate_to_human": {"reason", "ticket_id"},
+                 "request_permission": {"customer_id", "amount", "reason"}}
+        rule = {"type": "must_ask_permission", "condition": {
+            "before_tool": "issue_refund",
+            "permission_tool": "<YOUR_APPROVAL_TOOL>",
+            "arg": "amount", "exceeds": "<THRESHOLD>",
+            "match_arg": "<IDENTITY_ARG>",
+            "permission_match_arg": "<IDENTITY_ARG_ON_APPROVAL_TOOL>",
+            "cumulative": True}}
+        probe = approval._with_placeholders_resolved(rule, vocab)
+        resolved = probe["condition"]["permission_match_arg"]
+        self.assertNotEqual(resolved, "__probe__")
+        self.assertIn(resolved, vocab[probe["condition"]["permission_tool"]])
+
+    def test_a_sound_permission_rule_is_not_withheld(self):
+        """End to end: the proposal reaches a human rather than a reject list."""
+        vocab = {"issue_refund": {"customer_id", "amount"},
+                 "escalate_to_human": {"reason", "ticket_id"},
+                 "delete_customer_data": {"customer_id"}}
+        candidates = extractor.complete_from_schema(
+            extractor.merge(extractor.from_tool_schemas(vocab)), vocab)
+        reviewable, withheld = approval.screen(candidates, vocab)
+        self.assertEqual(withheld, [], withheld)
+        self.assertIn("must_ask_permission",
+                      [c["rule_type"] for c in reviewable])
+
     def test_a_numeric_placeholder_does_not_crash_the_screen(self):
         """
         Regression: the probe substituted a string for `exceeds`, and the
@@ -1962,15 +2148,142 @@ class TestOriginLedger(unittest.TestCase):
         decorative, and `prove` cannot tell them apart — it shows a rule CAN
         fail against a synthetic trajectory, not that it ever does against
         an agent.
+
+        Rewritten once. It originally asserted that a rule passing six times
+        in an all-green history counted as unproven, which conflated a fact
+        about the rule with a fact about the runs. The rule has to have been
+        in a scenario that failed for its silence to mean anything, so the
+        history here contains a failure alongside it.
         """
-        self._write(*[self._entry([{"id": "quiet", "passed": True,
-                                    "error": False, "generated": True}])
-                      for _ in range(6)])
+        # `loud` fires on some runs, not all. A rule firing on every single
+        # evaluation is now read as unsatisfiable rather than as an agent
+        # misbehaving, so an all-failing fixture would test the wrong thing —
+        # which is what this fixture originally did.
+        runs = []
+        for i in range(6):
+            failed = i % 2 == 0
+            runs.append({"ts": str(i), "scenario": "s",
+                         "status": "FAIL" if failed else "PASS", "rules": [
+                {"id": "quiet", "passed": True, "error": False, "generated": True},
+                {"id": "loud", "passed": not failed, "error": False,
+                 "generated": True}]})
+        self._write(*runs)
         report = history.by_origin()
         self.assertEqual(report["generated"]["never_fired"], ["quiet"])
         rendered = history.render_by_origin(report)
         self.assertIn("quiet", rendered)
         self.assertIn("unproven by use", rendered)
+
+    def test_an_unknown_scenario_is_not_reported_as_an_empty_ledger(self):
+        """
+        History is keyed on the contract's `name:` field, which is often not
+        the name it is launched by — `main.py run refund_baseline` records
+        under `refund_requires_identity_verification`. Querying by the
+        launch name returned the empty-ledger message, sending a reader to
+        look for data that had been recorded the whole time.
+        """
+        self._write(self._entry([{"id": "a", "passed": True, "error": False,
+                                  "generated": False}]))
+        report = history.by_origin("some_other_name")
+        rendered = history.render_by_origin(report)
+        self.assertIn("Nothing recorded for", rendered)
+        self.assertIn("s", rendered)
+        self.assertNotIn("needs runs", rendered)
+
+    def test_a_rule_that_always_fires_is_named_as_the_suspect(self):
+        """
+        From a live run. A rule forbidding the very tool its scenario is
+        exercised by was accepted past two warnings, and then failed all ten
+        runs. The board read as an agent misbehaving consistently; the agent
+        had complied every time.
+
+        `prove` shows such a rule CAN go red. Firing on every evaluation says
+        it can do nothing else.
+        """
+        self._write(*[
+            {"ts": str(i), "scenario": "s", "status": "FAIL", "rules": [
+                {"id": "impossible", "passed": False, "error": False,
+                 "generated": True}]}
+            for i in range(4)])
+        report = history.by_origin()
+        self.assertEqual(report["_unconditional"], ["impossible"])
+        rendered = history.render_by_origin(report)
+        self.assertIn("Fired on every evaluation", rendered)
+        # Both explanations named. Asserting the rule is at fault was wrong:
+        # a sound rule against a mock agent that misbehaves by construction
+        # fires just as unconditionally.
+        self.assertIn("or the agent failed every run", rendered)
+
+    def test_an_always_firing_rule_gives_others_no_opportunity(self):
+        """
+        The consequence that matters. A scenario failing only because of an
+        unsatisfiable rule never saw the agent misbehave, so a quiet rule
+        beside it is not unproven — it was never given a chance. Reporting
+        otherwise blamed a sound hand-written rule for an accepted mistake.
+        """
+        self._write(*[
+            {"ts": str(i), "scenario": "s", "status": "FAIL", "rules": [
+                {"id": "impossible", "passed": False, "error": False,
+                 "generated": True},
+                {"id": "sound", "passed": True, "error": False,
+                 "generated": False}]}
+            for i in range(4)])
+        report = history.by_origin()
+        self.assertEqual(report["hand_written"]["never_fired"], [])
+        self.assertEqual(report["hand_written"]["never_had_the_chance"], ["sound"])
+
+    def test_a_genuinely_caught_failure_still_creates_opportunity(self):
+        """
+        The detector must not swallow real failures. A rule that fires
+        sometimes is catching an agent, and its scenario does give others a
+        chance.
+        """
+        runs = []
+        for i in range(4):
+            failed = i % 2 == 0
+            runs.append({"ts": str(i), "scenario": "s",
+                         "status": "FAIL" if failed else "PASS", "rules": [
+                {"id": "real", "passed": not failed, "error": False,
+                 "generated": False},
+                {"id": "quiet", "passed": True, "error": False,
+                 "generated": True}]})
+        self._write(*runs)
+        report = history.by_origin()
+        self.assertEqual(report["_unconditional"], [])
+        self.assertEqual(report["generated"]["never_fired"], ["quiet"])
+
+    def test_a_rule_whose_scenario_never_failed_is_not_called_unproven(self):
+        """
+        Found on real history the moment the report was first reachable. One
+        scenario had been deliberately broken during a demo, so nine runs
+        failed; every other rule in the suite was then listed as "never gone
+        red" — which described the runs, not the rules. A rule cannot fire in
+        a scenario where nothing ever went wrong.
+        """
+        self._write(
+            {"ts": "1", "scenario": "quiet", "status": "PASS", "rules": [
+                {"id": "calm", "passed": True, "error": False, "generated": False}]},
+            {"ts": "2", "scenario": "broken", "status": "FAIL", "rules": [
+                {"id": "fired", "passed": False, "error": False, "generated": False}]})
+        report = history.by_origin()
+        self.assertEqual(report["hand_written"]["never_fired"], [])
+        self.assertEqual(report["hand_written"]["never_had_the_chance"], ["calm"])
+
+    def test_a_rule_that_stayed_quiet_while_its_scenario_failed_is_named(self):
+        """The signal itself: same scenario, one rule fired and one did not."""
+        self._write(
+            {"ts": "1", "scenario": "s", "status": "FAIL", "rules": [
+                {"id": "fired", "passed": False, "error": False, "generated": False},
+                {"id": "quiet", "passed": True, "error": False, "generated": False}]})
+        report = history.by_origin()
+        self.assertEqual(report["hand_written"]["never_fired"], ["quiet"])
+        self.assertEqual(report["hand_written"]["never_had_the_chance"], [])
+
+    def test_a_history_with_no_failures_says_so(self):
+        self._write(self._entry([{"id": "a", "passed": True, "error": False,
+                                  "generated": False}]))
+        rendered = history.render_by_origin(history.by_origin())
+        self.assertIn("No recorded run failed", rendered)
 
     def test_thin_data_is_labelled_a_tally_not_a_finding(self):
         self._write(self._entry([{"id": "gen", "passed": True, "error": False,

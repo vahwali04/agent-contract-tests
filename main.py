@@ -120,6 +120,10 @@ def gather_candidates(args):
             return {}, [], [], [], (
                 f"could not read {args.tools_from}: {type(exc).__name__}: {exc}")
         candidates += extractor.from_tool_schemas(vocab)
+        # Ordering implied by where an argument's value must come from. Costs
+        # nothing and needs no model — and it reaches a rule type the rest of
+        # the schema source cannot.
+        candidates += extractor.from_parameter_provenance(vocab)
 
     for path in args.implementation:
         found, err = extractor.from_implementations(path, vocab or None)
@@ -378,6 +382,15 @@ def run_approve(args):
     return 0
 
 
+def run_origins(args):
+    """Compare generated rules against hand-written ones. Returns an exit code."""
+    report = history.by_origin(args.scenario, None)
+    print()
+    print(history.render_by_origin(report))
+    print()
+    return 0
+
+
 def run_prove(args):
     """Check every contract is falsifiable. Returns a process exit code."""
     if args.path:
@@ -633,6 +646,13 @@ def main():
                                 "proposal per rule, not the same rule from each "
                                 "source.")
 
+    or_parser = subparsers.add_parser(
+        "origins",
+        help="Do generated rules behave like hand-written ones? Reports how "
+             "often each kind has actually gone red, from recorded runs.")
+    or_parser.add_argument("scenario", nargs="?", default=None,
+                           help="Limit to one scenario (default: all recorded).")
+
     prove_parser = subparsers.add_parser(
         "prove",
         help="Prove each contract CAN fail. Synthesises a violating trajectory "
@@ -689,6 +709,9 @@ def main():
 
     if args.command == "approve":
         sys.exit(run_approve(args))
+
+    if args.command == "origins":
+        sys.exit(run_origins(args))
 
     if args.command != "run":
         parser.print_help()

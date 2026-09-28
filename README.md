@@ -1,6 +1,6 @@
 # Agent Behavioral Contract Tests
 
-Write down what your AI agent must never do. This checks it on every pull request and blocks the merge when it does.
+Write down what your AI agent must never do. This checks it on every pull request and fails the build when it does — and with branch protection on, that blocks the merge.
 
 Rules are YAML, evaluated against the agent's **tool-call trajectory** — the sequence of tools it called and with what arguments. No LLM judge: the same trajectory always yields the same verdict.
 
@@ -287,7 +287,7 @@ RULE EVALUATION:
 OVERALL RESULT: FAIL
 ```
 
-You get the full trajectory, which rule broke, and the exact call that broke it. **Exit code 1** — that's what blocks a merge.
+You get the full trajectory, which rule broke, and the exact call that broke it. **Exit code 1** — that's what fails the check. See [Making it actually block](#making-it-actually-block) for the step that turns a failed check into a blocked merge.
 
 **Six possible outcomes.** Most of the engineering went into not lying to you: a red check should mean the agent broke, and a green one that it didn't.
 
@@ -304,7 +304,7 @@ A `FAIL` on a rule referencing a threshold that appears nowhere in your agent's 
 
 ### Step 5 — Put it in CI
 
-Run your whole contracts directory — exit 1 blocks the merge:
+Run your whole contracts directory — exit 1 fails the check:
 
 ```bash
 python3 scripts/run_all.py --scenarios contracts/ \
@@ -329,6 +329,30 @@ Useful flags on both commands: `--repeat N` (measure flakiness), `--concurrency 
 That helps when a transport degrades *over time*. It does not help when one fails immediately — the same team found a free quick-tunnel dying on the first request, seconds after its own precheck reported healthy. Short bursts are not a substitute for a transport that stays up. On `scripts/run_all.py` only: `--scenarios`, `--domain`, `--enforce-coverage`. For the bundled Claude agent: `--model`, `--prompt-variant`.
 
 ---
+
+### Making it actually block
+
+A failing check is advisory by default. GitHub shows it red and leaves the merge button enabled. Turning that into a gate is one step, and it is not part of this action:
+
+```bash
+gh api repos/OWNER/REPO/branches/main/protection \
+  --method PUT --input - <<'JSON'
+{"required_status_checks": {"strict": true, "contexts": ["behavioral-tests"]},
+ "enforce_admins": false,
+ "required_pull_request_reviews": null,
+ "restrictions": null}
+JSON
+```
+
+`behavioral-tests` is the job name in your workflow — use whatever yours is called, exactly.
+
+Three things worth knowing before you rely on it:
+
+- **Run the workflow once first.** A required check that has never reported blocks every merge forever rather than failing open, and a typo in the name produces exactly that.
+- **Branch protection needs a public repo, or GitHub Pro / Team.** A private repo on a free account cannot enable it at all — both the protection and ruleset APIs return 403. The check still goes red; nothing enforces it.
+- **`enforce_admins: false` lets repo admins merge past a red check.** That is a reasonable default while you are adopting it, and an odd one to leave in place afterwards. `gh api .../protection/enforce_admins --method POST` turns it on.
+
+Until one of those is configured, "blocks the merge" describes your GitHub settings rather than this action.
 
 ## Reference
 

@@ -372,8 +372,54 @@ def by_origin(scenario=None, config=None):
     is nothing recorded — an empty ledger is not a finding of parity.
     """
     entries = load(scenario)
+    # A scenario filter that matches nothing is not the same as an empty
+    # ledger, and rendering both as "needs runs" sent a reader looking for
+    # missing data that was actually recorded under another key: history is
+    # keyed on the contract's `name:` field, not the CLI argument used to
+    # launch it.
+    if scenario and not entries and load(None):
+        return {"_unknown_scenario": scenario,
+                "_known": sorted({e.get("scenario") for e in load(None)
+                                  if e.get("scenario")})}
     if config:
         entries = [e for e in entries if _matches(e, config)]
+
+    # Scenarios that have ever produced a failing run. A rule whose scenario
+    # never failed was never given the chance to fire, so listing it as
+    # "never gone red" describes the runs rather than the rule. Scoped per
+    # scenario rather than globally: one deliberately broken scenario made
+    # every other rule in the suite look unproven.
+    # A rule that fires on every evaluation has two possible explanations,
+    # and a fire rate cannot separate them: the rule is unsatisfiable, or the
+    # agent is non-compliant on every run. Both have been seen here — a
+    # generated ban on the tool its scenario is exercised by, and a sound
+    # rule against a mock agent that skips verification by construction.
+    #
+    # So this marks a pattern rather than assigning blame, and the reader is
+    # pointed at the check that does distinguish them: whether any behaviour
+    # could satisfy the rule given the scenario's exercised_when.
+    #
+    # It still withholds opportunity either way, which is the conservative
+    # direction. If the rule is broken, the failures are not evidence about
+    # the agent. If the agent is uniformly non-compliant, a quiet rule beside
+    # it has still not been shown to discriminate.
+    tally = {}
+    for e in entries:
+        for r in e.get("rules") or []:
+            if not r.get("id"):
+                continue
+            s = tally.setdefault(r["id"], [0, 0])
+            s[0] += 1
+            s[1] += int(not r.get("passed") and not r.get("error"))
+    unconditional = {rid for rid, (n, fired) in tally.items()
+                     if n >= 3 and fired == n}
+
+    adverse_scenarios = {
+        e.get("scenario") for e in entries
+        if e.get("status") == "FAIL"
+        and any(not r.get("passed") and not r.get("error")
+                and r.get("id") not in unconditional
+                for r in e.get("rules") or [])}
 
     buckets = {"generated": {}, "hand_written": {}}
     for entry in entries:
@@ -382,22 +428,35 @@ def by_origin(scenario=None, config=None):
                 continue
             side = "generated" if rule.get("generated") else "hand_written"
             seen = buckets[side].setdefault(
-                rule["id"], {"evaluated": 0, "fired": 0, "errored": 0})
+                rule["id"], {"evaluated": 0, "fired": 0, "errored": 0,
+                             "had_opportunity": False})
             seen["evaluated"] += 1
             seen["fired"] += int(not rule.get("passed") and not rule.get("error"))
             seen["errored"] += int(bool(rule.get("error")))
+            if entry.get("scenario") in adverse_scenarios:
+                seen["had_opportunity"] = True
 
     if not any(buckets.values()):
         return None
 
-    out = {}
+    # Whether anything in scope ever failed at all. A rule cannot be shown to
+    # fire in a history of exclusively compliant runs, so without this the
+    # never-fired list reads as a finding about the rules when it is a fact
+    # about the runs.
+    adverse = any(e.get("status") == "FAIL" for e in entries)
+
+    out = {"_adverse_runs": adverse, "_unconditional": sorted(unconditional)}
     for side, rules in buckets.items():
-        never = sorted(rid for rid, s in rules.items() if not s["fired"])
+        never = sorted(rid for rid, s in rules.items()
+                       if not s["fired"] and s["had_opportunity"])
+        untested = sorted(rid for rid, s in rules.items()
+                          if not s["fired"] and not s["had_opportunity"])
         out[side] = {
             "rules": len(rules),
             "evaluations": sum(s["evaluated"] for s in rules.values()),
             "ever_fired": sum(1 for s in rules.values() if s["fired"]),
             "never_fired": never,
+            "never_had_the_chance": untested,
             "errored": sorted(rid for rid, s in rules.items() if s["errored"]),
         }
     return out
@@ -405,6 +464,13 @@ def by_origin(scenario=None, config=None):
 
 def render_by_origin(report):
     """A comparison, or an honest statement that there is nothing to compare."""
+    if report and report.get("_unknown_scenario"):
+        known = report["_known"]
+        return (f"Nothing recorded for {report['_unknown_scenario']!r}.\n\n"
+                f"  History is keyed on the contract's `name:` field, which is "
+                f"often not the\n  name you run it by. Recorded: "
+                f"{', '.join(known) if known else '(none)'}")
+
     if not report:
         return ("No per-rule outcomes recorded yet. Rules accepted through "
                 "`approve` are marked generated: true, but the comparison needs "
@@ -423,11 +489,35 @@ def render_by_origin(report):
         lines.append(f"\n  Too few runs to compare ({', '.join(thin)} under 5 "
                      f"evaluations). The table is a tally, not a finding.")
 
+    if report.get("_unconditional"):
+        lines.append(
+            f"\n  Fired on every evaluation: {', '.join(report['_unconditional'])}."
+            f"\n  Either no behaviour can satisfy the rule, or the agent failed "
+            f"every run.\n  A fire rate cannot tell those apart — check whether "
+            f"the scenario's\n  exercised_when makes the rule satisfiable at "
+            f"all. Other rules in these\n  runs are not counted as having had "
+            f"an opportunity either way.")
+
+    for side in ("hand_written", "generated"):
+        idle = report[side].get("never_had_the_chance") or []
+        if idle:
+            lines.append(f"\n  {len(idle)} {side} rule(s) sit in scenarios that "
+                         f"have never failed,\n  so they were never given the "
+                         f"chance to fire. Not a finding about them.")
+
+    if not report.get("_adverse_runs"):
+        lines.append(
+            "\n  No recorded run failed, so no rule could have fired. This says "
+            "nothing\n  about the rules — it says the agent behaved throughout. "
+            "A never-fired list\n  is only informative once the history contains "
+            "behaviour worth catching.")
+        return "\n".join(lines)
+
     for side in ("hand_written", "generated"):
         never = report[side]["never_fired"]
         if never:
-            lines.append(f"\n  {side} rules that have never gone red: "
-                         f"{', '.join(never)}")
+            lines.append(f"\n  {side} rules that have never gone red, in runs "
+                         f"where others did: {', '.join(never)}")
             lines.append("  Not proof they are wrong — proof they are unproven "
                          "by use. `prove` shows a rule CAN fail; only a run "
                          "shows it ever does.")

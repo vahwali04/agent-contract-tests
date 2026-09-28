@@ -6,3 +6,7 @@ venv/
 behavioral-test-report.md
 .agenttest_history.jsonl
 .agenttest_rejections.jsonl
+# Any ledger written by pointing AGENTTEST_HISTORY somewhere else for a
+# one-off experiment. Run data, never source — one of these was committed
+# because only the two default names were listed.
+*.jsonl

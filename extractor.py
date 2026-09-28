@@ -44,8 +44,15 @@ THRESHOLD_ARGS = [
 ]
 
 # Arguments that look like "who or what this acts on".
+#
+# `subject` was here for the grammatical sense and collides with an email's
+# subject line, which is free text describing a new message rather than a
+# reference to an entity. Two threads trivially share "Re: Thursday sync", so
+# it can never work as an identity key — offering it as a candidate turned a
+# settled question into an open one. Reported by the team whose schema
+# exposed the collision.
 IDENTITY_HINTS = ["id", "user", "customer", "account", "recipient", "target",
-                  "subject", "thread", "message", "ticket", "email", "address"]
+                  "thread", "message", "ticket", "email", "address"]
 
 ALLOWLIST_WARNING = (
     "Weak by construction: if the agent cannot call this tool, a contract "
@@ -80,7 +87,17 @@ def identity_args(params):
     ambiguity is the finding.
     """
     hits = [p for p in params if any(h in w for w in _words(p) for h in IDENTITY_HINTS)]
-    return hits
+
+    # A collection of identifiers is a payload, not the subject being acted
+    # on: update_message_labels(messageId, addLabelIds, removeLabelIds) acts
+    # on one message and carries a set of labels. Dropping collections leaves
+    # the singular reference, which is the thing a rule follows. Only applied
+    # when it still leaves a candidate, so a tool taking nothing but a
+    # collection is not reduced to none.
+    singular = [p for p in hits if _identifier_subject(p) is None
+                or not p.lower().rstrip("s").endswith("id")
+                or not p.lower().endswith("s")]
+    return singular or hits
 
 
 def candidate(rule_type, confidence, source, evidence, rule, caveats=None):
@@ -170,6 +187,101 @@ def from_tool_schemas(vocab):
                 f"'{tool}' takes {arg!r}, a magnitude worth gating on",
                 rule, caveats))
 
+    return out
+
+
+# Prefixes naming a tool that hands back identifiers for a kind of thing,
+# rather than consuming one. Deliberately not `get_`/`search_`: get_thread
+# takes a threadId, it does not mint one, and including them proposes an
+# ordering rule between almost every pair of tools.
+# Ordered by how unconditionally the tool yields an identifier. `list_` is a
+# lookup over what already exists and is always a valid precondition;
+# `create_` only mints one when it is absent, so requiring it would fail every
+# run where the thing already existed. Preferring the unconditional producer
+# is what makes the proposed rule sound, not which one a given suite happens
+# to have chosen.
+PRODUCER_PREFIXES = ("list_", "create_")
+
+
+def _words_only(text):
+    """Letters and digits, single-spaced. Strips markdown and punctuation."""
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def _identifier_subject(param):
+    """
+    The kind of thing an identifier parameter refers to, or None.
+
+    `addLabelIds` -> "label", `threadId` -> "thread". Matching is on the
+    parameter's own shape, so it works for camelCase and snake_case alike.
+    """
+    words = [w for w in re.split(r"[^a-z0-9]+", re.sub(r"(?<!^)(?=[A-Z])", "_", param).lower()) if w]
+    if not words or words[-1] not in ("id", "ids"):
+        return None
+    subject = words[-2] if len(words) > 1 else None
+    if not subject:
+        return None
+    return subject[:-1] if subject.endswith("s") and len(subject) > 3 else subject
+
+
+def from_parameter_provenance(vocab):
+    """
+    Ordering implied by where an argument's value has to come from.
+
+    This contradicts a claim made repeatedly elsewhere in this project — that
+    ordering between tools has no structural signature and a schema cannot
+    express it. That was wrong, and the counterexample came from the team
+    whose suite it was measured against: `update_message_labels` takes
+    `addLabelIds`, and the only tools that mint a label id are `list_labels`
+    and `create_label`. Nothing in prose is needed to see that one must
+    precede the other.
+
+    Conservative by construction. Only `list_*` and `create_*` are treated as
+    producers, because `get_thread(threadId)` consumes an identifier rather
+    than issuing one, and counting it would propose an ordering rule between
+    nearly every pair of tools in a vocabulary.
+    """
+    producers = {}
+    for prefix in PRODUCER_PREFIXES:
+        for tool in sorted(vocab):
+            if tool.lower().startswith(prefix):
+                subject = tool[len(prefix):].lower().rstrip("s") or tool.lower()
+                producers.setdefault(subject, []).append(tool)
+
+    # One rule per (consumer, producer) pair. addLabelIds and removeLabelIds
+    # imply the same ordering, and proposing it twice would read as two
+    # findings and score as two inventions.
+    pairs = {}
+    for tool in sorted(vocab):
+        for param in sorted(vocab[tool]):
+            subject = _identifier_subject(param)
+            if not subject or subject not in producers:
+                continue
+            sources = [p for p in producers[subject] if p != tool]
+            if not sources:
+                continue
+            pairs.setdefault((tool, subject, tuple(sources)), []).append(param)
+
+    out = []
+    for (tool, subject, sources), params in sorted(pairs.items()):
+            params = sorted(params)
+            shown = " and ".join(repr(p) for p in params)
+            out.append(candidate(
+                "must_precede", "medium", "tool schema",
+                f"'{tool}' takes {shown}, and only {' or '.join(sources)} "
+                f"produces a {subject} id",
+                {"type": "must_precede",
+                 "condition": {"before_tool": tool,
+                               "required_tool": sources[0],
+                               "match_arg": None,
+                               "required_match_arg": None}},
+                ([f"More than one tool mints a {subject} id ({sources}); this "
+                  f"proposal names the first. Pick the one your agent should use."]
+                 if len(sources) > 1 else []) +
+                [f"Identity matching is left unset: {sources[0]} is a lookup over "
+                 f"the whole account, not a call about one {subject}, so there is "
+                 f"no subject to match on. Set match_arg only if yours differs."],
+            ))
     return out
 
 
@@ -479,7 +591,13 @@ def from_system_prompt(path, vocab, model="claude-sonnet-4-5-20250929"):
         if not isinstance(line_no, int) or not 1 <= line_no <= len(lines):
             continue
         source_line = lines[line_no - 1]
-        if quote and quote.lower()[:40] not in source_line.lower():
+        # Compared on words alone. A model quoting a markdown line reasonably
+        # drops the list prefix and the ** emphasis — "2. **Never delete.**
+        # Removing..." comes back as "Never delete. Removing..." — and a raw
+        # substring test called that a fabricated citation. Punctuation and
+        # decoration are not content, and this is the third time markdown
+        # formatting has broken a string comparison here.
+        if quote and _words_only(quote)[:40] not in _words_only(source_line):
             out.append(candidate(
                 rule.get("type", "?"), "low", "system prompt",
                 f"line {line_no} — CITATION DID NOT MATCH; model quoted "
@@ -685,6 +803,13 @@ def complete_from_schema(candidates, vocab):
         for field, owners in IDENTITY_FIELDS_BY_TYPE.get(c["rule_type"], []):
             if field in cond and not _unfilled(cond[field]):
                 continue
+            # An explicit null is an answer, not a blank. A source that writes
+            # None has said "this rule has no identity dimension" — which is
+            # true of a lookup over a whole account — and overriding it with a
+            # guessed argument turns a correct rule into one that matches
+            # nothing. Absence means unanswered; None means answered.
+            if field in cond and cond[field] is None:
+                continue
             tool = next((cond.get(o) for o in owners if cond.get(o)), None)
             if not tool or tool not in vocab or _unfilled(tool):
                 continue
@@ -754,7 +879,16 @@ def benchmark(candidates, reference_rules):
             unfilled, differs = [], []
             for field, want in reference_cond.items():
                 got = cond.get(field)
-                if got is None:
+                if field not in cond:
+                    unfilled.append(field)
+                elif got is None and want is None:
+                    # A deliberate null, not a blank. Their labels contract
+                    # sets match_arg to null because list_labels is an
+                    # account-wide lookup with no subject to match on;
+                    # scoring that as unanswered marked a correct proposal
+                    # incomplete.
+                    continue
+                elif got is None:
                     unfilled.append(field)
                 elif isinstance(got, str) and got.startswith("<"):
                     unfilled.append(field)
@@ -833,11 +967,10 @@ def render_benchmark(result, reference_count):
         types = {rt for _l, rt, _t, _s, _f in result["misses"]}
         if types == {"must_precede"}:
             lines.append(
-                "\n  Every miss is must_precede. Ordering between tools has no "
-                "structural signature —\n  a schema cannot express it — so it is "
-                "reachable only from an implementation guard\n  or from prose. "
-                "That makes prompt extraction load-bearing for this rule type, "
-                "not optional.")
+                "\n  Every miss is must_precede. Some ordering is visible in a "
+                "schema — where one\n  tool consumes an identifier only another "
+                "can mint — but ordering with no such\n  data dependency is "
+                "reachable only from an implementation guard or from prose.")
     return "\n".join(lines)
 
 
