@@ -517,6 +517,9 @@ def main():
             f.write(f"misconfigured={len(broken)}\n")
             f.write(f"errored={len(errored)}\n")
             f.write(f"total={len(results)}\n")
+            # Relative, so a consumer can upload it as an artifact without
+            # knowing where the runner put the workspace.
+            f.write("report=behavioral-test-report.md\n")
 
     # Inconclusive results block by default: a suite that silently stopped
     # testing anything is exactly the condition a CI gate should surface,

@@ -15,6 +15,28 @@ Rules are YAML, evaluated against the agent's **tool-call trajectory** — the s
     required_match_arg: customer_id # …must be the one who was verified
 ```
 
+### Why not just have a model grade the output?
+
+Because an agent's account of itself can be accurate while its behaviour is wrong, and that is not an edge case — it is the normal shape of a broken tool integration.
+
+Here is the demonstration, which you can run yourself. `--drop` discards a tool's calls: the agent asks for the tool, receives a success reply, and carries on. It has no way to know.
+
+```bash
+python3 main.py run refund_baseline --behavior correct --drop verify_identity
+```
+
+```
+[FAIL] identity_verification_required_before_refund
+   Reason: 'issue_refund' called with customer_id='dana' before
+           'verify_identity' was called for that user.
+```
+
+The agent's summary of this run is *correct*. It did request verification, it did believe it succeeded, and it will tell you so. **A model grading that summary sees a well-behaved agent.** The trajectory shows the call never landed.
+
+An output grader can only see what the agent says about its work. A trajectory check sees the work. That is the whole argument, and it costs nothing to verify: no API key, no model, one command.
+
+The same command with `--drop get_customer` — a tool no rule watches — passes. The gate reddens for the thing it was written to watch and stays quiet otherwise, which is the half of the claim most testing tools never check.
+
 ### Does this fit your agent?
 
 **Yes** if your agent calls tools/functions and you can say "it must never do X" or "it must always do X before Y" — money movement, refunds, data deletion, permissions, external writes.
@@ -312,15 +334,46 @@ python3 scripts/run_all.py --scenarios contracts/ \
 ```
 
 ```yaml
-- uses: vahwali04/agent-testv1@main
+- uses: vahwali04/agent-contract-tests@v1
   with:
     agent: http
     agent-url: http://localhost:8080/agent
+    contracts: contracts/        # YOUR contract files
 ```
+
+**`contracts:` is the one you must set.** Leave it out and the action runs the
+bundled demo contracts, which describe a banking agent and a support agent —
+they will not match yours, and every result will be meaningless. The default
+exists only so this action can test itself.
 
 Needs `permissions: { contents: read, pull-requests: write, issues: write }` to post the PR comment. Working example: [`.github/workflows/self-test.yml`](.github/workflows/self-test.yml).
 
-> **This repo is private**, so that `uses:` reference only resolves inside this repo. Elsewhere, check the code out and use `uses: ./`.
+The action exposes counts you can gate on or report:
+
+```yaml
+- uses: vahwali04/agent-contract-tests@v1
+  id: contracts
+  with:
+    agent: http
+    agent-url: http://localhost:8080/agent
+    contracts: contracts/
+    repeat: "3"                  # a variance bound, at 3x the tokens
+    abort-after: "3"             # stop after 3 consecutive transport failures
+
+- name: Fail if the suite stopped testing anything
+  if: steps.contracts.outputs.inconclusive != '0'
+  run: |
+    echo "${{ steps.contracts.outputs.inconclusive }} contract(s) INCONCLUSIVE"
+    exit 1
+
+- uses: actions/upload-artifact@v4
+  if: always()
+  with:
+    name: contract-report
+    path: ${{ steps.contracts.outputs.report }}
+```
+
+Outputs: `passed`, `failed`, `inconclusive`, `refused`, `misconfigured`, `errored`, `total`, `report`. Gating on `misconfigured` is worth considering too — it means a contract is broken rather than the agent.
 
 Useful flags on both commands: `--repeat N` (measure flakiness), `--concurrency N` (default 6, or 1 for `--agent http`), `--agent-header "X-Token: ..."`.
 

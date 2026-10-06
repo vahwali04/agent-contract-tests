@@ -26,6 +26,7 @@ import yaml
 
 import history
 import approval
+import degraded
 import extractor
 import prover
 from agent.base_agent import BaseAgent
@@ -2316,3 +2317,109 @@ class TestOriginLedger(unittest.TestCase):
         results = evaluate_trajectory(
             [{"tool": "delete_account", "args": {}, "result": None}], rules)
         self.assertEqual([r["generated"] for r in results], [True, False])
+
+
+class TestDegradation(unittest.TestCase):
+    """
+    The degraded agent exists to produce regressions on demand, because four
+    attempts to catch a natural one found an agent that does not misbehave.
+
+    Its whole value rests on one property: the degradation must not be written
+    against the contracts. A mode saying "violate rule X" would make rule X
+    firing a tautology, and the experiment would measure nothing while looking
+    like it measured something.
+    """
+
+    def _contract_vocabulary(self):
+        """Rule ids, rule types, and tool names from every contract in the repo."""
+        import glob
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        words = set()
+        for path in glob.glob(os.path.join(root, "**", "*.yaml"), recursive=True):
+            if path.endswith("TEMPLATE.yaml"):
+                continue
+            try:
+                doc = yaml.safe_load(open(path)) or {}
+            except Exception:
+                continue
+            for rule in doc.get("behavioral_rules") or []:
+                if rule.get("id"):
+                    words.add(rule["id"].lower())
+                if rule.get("type"):
+                    words.add(rule["type"].lower())
+                for value in (rule.get("condition") or {}).values():
+                    if isinstance(value, str) and "_" in value:
+                        words.add(value.lower())
+        return words
+
+    def test_degradation_is_not_written_against_the_contracts(self):
+        """
+        No disposition may name a rule, a rule type, or a tool. If a mode said
+        "never call verify_identity", the rule requiring it would fire by
+        construction and the result would be circular.
+
+        Checked against every contract present, so adding a domain extends the
+        check automatically. The assertTrue guards the vacuous case: an empty
+        vocabulary would make the loop below pass without checking anything.
+        """
+        vocabulary = self._contract_vocabulary()
+        self.assertTrue(vocabulary, "no contracts found — the guard would pass vacuously")
+        for mode, text in degraded.BEHAVIOURAL_MODES.items():
+            lowered = text.lower()
+            for word in vocabulary:
+                self.assertNotIn(
+                    word, lowered,
+                    f"degradation {mode!r} names {word!r} from a contract — "
+                    f"any rule it trips would be tripped by construction")
+
+    def test_dispositions_do_not_name_rule_types(self):
+        """Belt and braces: the three rule types, independent of any file."""
+        for mode, text in degraded.BEHAVIOURAL_MODES.items():
+            for rule_type in ("must_precede", "must_never", "must_ask_permission"):
+                self.assertNotIn(rule_type, text.lower(), f"{mode} names {rule_type}")
+
+    def test_a_dropped_tool_leaves_the_trajectory(self):
+        """
+        The integration failure: the agent calls the tool and gets a success
+        reply, but nothing is recorded. This is the shape an output-grading
+        test cannot see at all — the agent's account of itself stays correct.
+        """
+        from tools.gateway import ToolGateway
+        calls = {"verify_identity": lambda **k: {"ok": True},
+                 "issue_refund": lambda **k: {"ok": True}}
+        gw = degraded.DroppingGateway(ToolGateway(calls), ["verify_identity"])
+
+        self.assertEqual(gw.call("verify_identity", customer_id="dana"),
+                         {"status": "ok"}, "the agent must not notice")
+        gw.call("issue_refund", customer_id="dana", amount=120)
+
+        self.assertEqual([c["tool"] for c in gw.get_trajectory()], ["issue_refund"])
+        self.assertEqual(len(gw.dropped_calls), 1)
+
+    def test_an_undropped_tool_is_untouched(self):
+        from tools.gateway import ToolGateway
+        gw = degraded.DroppingGateway(
+            ToolGateway({"issue_refund": lambda **k: {"ok": True}}), ["something_else"])
+        gw.call("issue_refund", customer_id="dana", amount=120)
+        self.assertEqual([c["tool"] for c in gw.get_trajectory()], ["issue_refund"])
+        self.assertEqual(gw.dropped_calls, [])
+
+    def test_degradation_appends_rather_than_replaces(self):
+        """
+        The agent keeps its real instructions so the degradation has to compete
+        with them. Replacing them would test a different agent, and would also
+        remove the resistance that made three earlier attempts fail.
+        """
+        out = degraded.degrade_prompt("ORIGINAL POLICY", "reckless")
+        self.assertIn("ORIGINAL POLICY", out)
+        self.assertIn(degraded.BEHAVIOURAL_MODES["reckless"], out)
+
+    def test_an_unknown_mode_raises(self):
+        with self.assertRaises(ValueError):
+            degraded.degrade_prompt("x", "not_a_mode")
+
+    def test_every_run_can_say_how_it_was_degraded(self):
+        """A reading from a degraded agent is worthless without its conditions."""
+        self.assertIn("reckless", degraded.describe("reckless", None))
+        self.assertIn("verify_identity", degraded.describe(None, ["verify_identity"]))
+        self.assertEqual(degraded.describe(None, None), "none")

@@ -43,6 +43,7 @@ from agent.http_agent import HTTPAgent
 from domains import DOMAINS, EXTERNAL_DOMAIN, PROMPT_VARIANTS, scenario_index
 import history
 import prover
+import degraded
 import extractor
 import approval
 from prover import parse_headers
@@ -382,6 +383,14 @@ def run_approve(args):
     return 0
 
 
+def gateway_wrapper(args):
+    """A DroppingGateway factory when --drop was given, else None."""
+    drop = getattr(args, "drop", None)
+    if not drop:
+        return None
+    return lambda gw: degraded.DroppingGateway(gw, drop)
+
+
 def run_origins(args):
     """Compare generated rules against hand-written ones. Returns an exit code."""
     report = history.by_origin(args.scenario, None)
@@ -584,6 +593,16 @@ def main():
              "scenarios, or with --agent http.",
     )
     run_parser.add_argument(
+        "--degrade", choices=sorted(degraded.BEHAVIOURAL_MODES),
+        help="Append a disposition to the agent's own instructions, making it "
+             "likely to misbehave. Dispositions are written without reference "
+             "to any rule — see degraded.py.")
+    run_parser.add_argument(
+        "--drop", action="append", default=[], metavar="TOOL",
+        help="Silently discard calls to TOOL. The agent gets a success reply "
+             "and never knows: a broken-integration regression that an "
+             "output-grading test cannot see. Repeatable.")
+    run_parser.add_argument(
         "--concurrency",
         type=positive_int,
         default=None,
@@ -721,7 +740,20 @@ def main():
 
     def build_agent():
         if args.agent == "anthropic":
-            return AnthropicAgent(model=args.model, prompt_variant=args.prompt_variant)
+            agent = AnthropicAgent(model=args.model,
+                                   prompt_variant=args.prompt_variant)
+            if getattr(args, "degrade", None):
+                # bind_domain replaces system_prompt with the domain's own, so
+                # the disposition is re-applied after binding rather than before.
+                _bind, _mode = agent.bind_domain, args.degrade
+                def bind_then_degrade(domain):
+                    _bind(domain)
+                    agent.system_prompt = degraded.degrade_prompt(
+                        agent.system_prompt, _mode)
+                agent.bind_domain = bind_then_degrade
+                agent.system_prompt = degraded.degrade_prompt(
+                    agent.system_prompt, _mode)
+            return agent
         if args.agent == "http":
             if not args.agent_url:
                 parser.error("--agent http requires --agent-url")
@@ -733,7 +765,8 @@ def main():
     config = history.config_of(args, concurrency=1)
 
     if args.repeat == 1:
-        result = run_scenario(scenario_path, build_agent(), domain=domain)
+        result = run_scenario(scenario_path, build_agent(), domain=domain,
+                              wrap_gateway=gateway_wrapper(args))
         history.record(result['scenario_name'], domain_name, config, result)
         print_report(result)
         if args.agent != "mock":
@@ -759,6 +792,7 @@ def main():
     from concurrent.futures import ThreadPoolExecutor
 
     statuses, trajectories = [], set()
+    shown_error = [False]
     observed_version = None
     scenario_key = args.scenario
     if args.agent == "mock":
@@ -770,7 +804,8 @@ def main():
     print(f"Running {args.repeat}x with concurrency {workers}...")
 
     def one_run(_i):
-        return run_scenario(scenario_path, build_agent(), domain=domain)
+        return run_scenario(scenario_path, build_agent(), domain=domain,
+                              wrap_gateway=gateway_wrapper(args))
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for i, result in enumerate(pool.map(one_run, range(args.repeat)), 1):
@@ -781,6 +816,15 @@ def main():
             trajectories.add(history.trajectory_hash(result["trajectory"]))
             print(f"  run {i}/{args.repeat}: {result['status']} "
                   f"({len(result['trajectory'])} tool calls)")
+            # Show why, once. Repeat mode printed bare ERRORED lines and
+            # swallowed the detail, so five failed runs gave a user nothing
+            # to act on — while a single run would have named the cause.
+            if result["status"] == "ERRORED" and not shown_error[0]:
+                shown_error[0] = True
+                print(f"      {result.get('error_detail') or 'no detail recorded'}")
+                if not result.get("error_retryable", True):
+                    print("      Not transient — the same thing will happen "
+                          "every run.")
 
     print(f"\n{'=' * 62}")
     print(f"REPEATED {args.repeat}x — {scenario_key}\n")
