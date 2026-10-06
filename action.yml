@@ -1,8 +1,8 @@
 name: "Agent Behavioral Contract Tests"
-description: >
-  Runs behavioral contract scenarios (regression + hand-written red-team
-  checks) against your AI agent on every pull request, so a merge can be
-  blocked when the agent violates a rule it must always follow.
+# Marketplace rejects a description of 125 characters or more. "Fails CI"
+# rather than "blocks merges": failing the check is what this action does,
+# and blocking needs branch protection on the consumer's repo.
+description: "Fails CI when your AI agent violates a rule it must always follow. Checks its tool calls, not its prose."
 branding:
   icon: "shield"
   color: "purple"
