@@ -28,18 +28,61 @@ inputs:
     description: "Only used when agent=mock: 'correct' or 'buggy'. Lets this action test itself."
     required: false
     default: "correct"
+  contracts:
+    description: >
+      Directory or glob of YOUR contract files. Without this the action runs
+      the bundled demo contracts, which describe a banking and a support
+      agent and will not match yours — useful only for testing this action
+      itself. Set it with agent=http, whose agent supplies its own
+      environment.
+    required: false
+  repeat:
+    description: >
+      Run each contract N times (default 1). A single green run means green
+      once; N runs give a variance bound. Costs N times the tokens.
+    required: false
+    default: "1"
+  abort-after:
+    description: >
+      Stop the sweep after N consecutive errored runs, so a broken endpoint
+      or a rejected credential does not spend a whole budget failing.
+    required: false
   python-version:
     description: "Python version to run the harness with."
     required: false
     default: "3.11"
 
 outputs:
+  # A composite action's output needs an explicit `value:`. Without it the
+  # output is always the empty string, however faithfully the step writes to
+  # GITHUB_OUTPUT — which it does, and which was being discarded here.
   passed:
-    description: "Number of scenarios that passed."
+    description: "Number of contracts that passed."
+    value: ${{ steps.run-tests.outputs.passed }}
   failed:
-    description: "Number of scenarios that failed."
+    description: "Number of contracts that failed."
+    value: ${{ steps.run-tests.outputs.failed }}
   total:
-    description: "Total number of scenarios run."
+    description: "Total number of contracts run."
+    value: ${{ steps.run-tests.outputs.total }}
+  # Already written by the runner, so exposing them costs nothing. A consumer
+  # gating on inconclusive > 0 is a legitimate use: it means the suite stopped
+  # testing anything rather than that the agent behaved.
+  inconclusive:
+    description: "Contracts where too little happened to judge."
+    value: ${{ steps.run-tests.outputs.inconclusive }}
+  refused:
+    description: "Contracts where the agent declined — acceptable, but untested."
+    value: ${{ steps.run-tests.outputs.refused }}
+  misconfigured:
+    description: "Contracts that are themselves broken, not the agent's fault."
+    value: ${{ steps.run-tests.outputs.misconfigured }}
+  errored:
+    description: "Runs where the agent or transport failed."
+    value: ${{ steps.run-tests.outputs.errored }}
+  report:
+    description: "Path to the markdown report, relative to the workspace."
+    value: ${{ steps.run-tests.outputs.report }}
 
 runs:
   using: "composite"
@@ -62,4 +105,7 @@ runs:
         python "${{ github.action_path }}/scripts/run_all.py" \
           --agent "${{ inputs.agent }}" \
           --behavior "${{ inputs.behavior }}" \
-          ${{ inputs['agent-url'] && format('--agent-url {0}', inputs['agent-url']) || '' }}
+          --repeat "${{ inputs.repeat }}" \
+          ${{ inputs['agent-url'] && format('--agent-url {0}', inputs['agent-url']) || '' }} \
+          ${{ inputs.contracts && format('--scenarios {0}', inputs.contracts) || '' }} \
+          ${{ inputs['abort-after'] && format('--abort-after {0}', inputs['abort-after']) || '' }}

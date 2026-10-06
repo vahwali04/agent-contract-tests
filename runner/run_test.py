@@ -237,7 +237,7 @@ def _errored_result(scenario, request_display, detail, trajectory, retryable=Tru
     }
 
 
-def run_scenario(scenario_path, agent, domain):
+def run_scenario(scenario_path, agent, domain, wrap_gateway=None):
     """
     `domain` is required. Defaulting it to banking meant a scenario from
     another domain would run against the wrong tool table: the gateway
@@ -255,6 +255,10 @@ def run_scenario(scenario_path, agent, domain):
 
     env = domain["make_state"]()
     gateway = ToolGateway(domain["make_tools"](env))
+    # A degraded run wraps the gateway to drop named tool calls. Applied here
+    # so the agent is unchanged and only the recorded trajectory differs.
+    if wrap_gateway is not None:
+        gateway = wrap_gateway(gateway)
     agent.bind_domain(domain)
 
     # Out-of-process agents are told which scenario they're running. Use the
